@@ -26,17 +26,45 @@ static char *receive_from_client(int client_fd)
         return NULL;
     }
 
-    ssize_t bytes_received = read(client_fd, buffer, MAX_STRLEN);
-    if (bytes_received < 0)
+    size_t total_read = 0;
+    ssize_t bytes_received;
+
+    while (total_read < MAX_STRLEN)
     {
-        fprintf(stderr, "[ERROR] -> Failed to receive data: %s\n", strerror(errno));
-        free(buffer);
-        return NULL;
+        bytes_received = read(client_fd, buffer + total_read, 1);
+
+        if (bytes_received < 0)
+        {
+            fprintf(stderr, "[ERROR] -> Failed to receive data: %s\n", strerror(errno));
+            free(buffer);
+            return NULL;
+        }
+
+        if (!bytes_received)
+        {
+            // connection closed by client
+            fprintf(stderr, "[ERROR] -> Connection closed by client\n");
+            free(buffer);
+            return NULL;
+        }
+
+        total_read++;
+
+        // check if we've received the termination sequence \r\n
+        if (total_read >= 2 &&
+            buffer[total_read - 2] == '\r' &&
+            buffer[total_read - 1] == '\n')
+        {
+            // remove the \r\n terminator
+            buffer[total_read - 2] = '\0';
+            return buffer;
+        }
     }
 
-    // null terminate the received data
-    buffer[bytes_received] = '\0';
-    return buffer;
+    // if we've read MAX_STRLEN without finding \r\n
+    fprintf(stderr, "[ERROR] -> Message too long or missing terminator\n");
+    free(buffer);
+    return NULL;
 }
 
 int main(int argc, char **argv)

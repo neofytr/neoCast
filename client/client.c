@@ -1,4 +1,3 @@
-#include "../inc/client.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -115,8 +114,9 @@ int main(int argc, char **argv)
     }
 
     // send hello message followed by username
-    send_to_server(server_fd, "HELLO");
+    send_to_server(server_fd, "HELLO\r\n");
     send_to_server(server_fd, user);
+    send_to_server(server_fd, "\r\n");
 
     printf("Connected to server. Sent username: %s\n", user);
 
