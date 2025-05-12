@@ -241,6 +241,10 @@ void *client_handler(void *arg)
         cleanup_and_close(client_fd, master_fd, child_pid, username);
         return NULL;
     }
+    else
+    {
+        send_to_client(client_fd, "VERIFIED\r\n");
+    }
 
     // fork a pseudo-terminal
     child_pid = forkpty(&master_fd, NULL, NULL, NULL);
@@ -253,7 +257,7 @@ void *client_handler(void *arg)
         return NULL;
     }
 
-    if (child_pid == 0)
+    if (!child_pid)
     {
         // child process (slave)
         // drop privileges to the authenticated user
