@@ -187,11 +187,74 @@ void *client_handler(void *arg)
     {
         // this is the child (slave)
 
-        // replace with a shell program
+        // drop privileges to the given user
+        if (!drop_privileges)
+        {
+            send_to_client(client_fd, "ERROR 104\r\n"); // couldn't drop privileges to the user; retry; closing connection
+            close(client_fd);
+            free(username);
+            return NULL;
+        }
+
+        // replace with the login shell of the user
+        struct passwd *pw = getpwnam(username);
+        if (!pw)
+        {
+            send_to_client(client_fd, "ERROR 105\r\n"); // couldn't get the login shell of the user; closing connection
+            free(username);
+            close(client_fd);
+            return NULL;
+        }
+
+        free(username);
+        username = NULL;
+        execl(pw->pw_shell, pw->pw_shell, "--login", (char *)NULL);
+
+        // will reach here only if there is an execl error
+        send_to_client(client_fd, "ERROR 106\r\n"); // couldn't spawn login shell of the user
+    }
+    else
+    {
+        // parent; relay data between client and server shell
+        fd_set fds;
+        while (true)
+        {
+            FD_ZERO(&fds);
+            FD_SET(client_fd, &fds);
+            FD_SET(master_fd, &fds);
+            int maxfd = (client_fd > master_fd ? client_fd : master_fd) + 1;
+
+            int ret = select(maxfd, &fds, NULL, NULL, NULL);
+            if (ret < 0)
+            {
+                fprintf(stderr, "[ERROR] -> select call failed: %s\n", strerror(errno));
+                send_to_client(client_fd, "ERROR 107\r\n");
+                // now kill the shell process
+                break;
+            }
+
+            // client -> pty
+            if (FD_ISSET(client_fd, &fds))
+            {
+                const char *msg = receive_from_client(client_fd);
+                send_to_client(master_fd, msg);
+                free(msg);
+            }
+
+            if (FD_ISSET(master_fd, &fds))
+            {
+                const char *msg = receive_from_client(master_fd);
+                send_to_client(client_fd, msg);
+                free(msg);
+            }
+        }
     }
 
     // cleanup
-    free(username);
+    if (username)
+    {
+        free(username);
+    }
     close(client_fd);
     return NULL;
 }
