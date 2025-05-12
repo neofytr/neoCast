@@ -21,10 +21,10 @@ shift $((OPTIND -1))
 # if clean mode is active, remove all compiled files
 if [ "$clean_mode" = true ]; then
     echo "cleaning all compiled objects and binaries..."
-    rm -rf release/strix/binaries/*
-    rm -rf release/dynarr/binaries/*
-    rm -f release/*.o
-    rm -f release/neobuild.o
+    rm -rf buildsysdep/strix/binaries/*
+    rm -rf buildsysdep/dynarr/binaries/*
+    rm -f buildsysdep/*.o
+    rm -f buildsysdep/neobuild.o
     echo "clean complete."
     exit 0
 fi
@@ -52,13 +52,13 @@ fi
 echo "using compiler: $CC"
 
 # ensure directories exist
-mkdir -p release/strix/binaries
-mkdir -p release/dynarr/binaries
-mkdir -p release
+mkdir -p buildsysdep/strix/binaries
+mkdir -p buildsysdep/dynarr/binaries
+mkdir -p buildsysdep
 
 # check and build strix.o if necessary
-STRIX_SRC="release/strix/source/main.c"
-STRIX_OBJ="release/strix/binaries/strix.o"
+STRIX_SRC="buildsysdep/strix/source/main.c"
+STRIX_OBJ="buildsysdep/strix/binaries/strix.o"
 
 if [ ! -f "$STRIX_OBJ" ] || [ "$STRIX_SRC" -nt "$STRIX_OBJ" ]; then
     echo "compiling strix.o"
@@ -70,8 +70,8 @@ if [ ! -f "$STRIX_OBJ" ] || [ "$STRIX_SRC" -nt "$STRIX_OBJ" ]; then
 fi
 
 # check and build dynarr.o if necessary
-DYNARR_SRC="release/dynarr/src/dynarr.c"
-DYNARR_OBJ="release/dynarr/binaries/dynarr.o"
+DYNARR_SRC="buildsysdep/dynarr/src/dynarr.c"
+DYNARR_OBJ="buildsysdep/dynarr/binaries/dynarr.o"
 
 if [ ! -f "$DYNARR_OBJ" ] || [ "$DYNARR_SRC" -nt "$DYNARR_OBJ" ]; then
     echo "compiling dynarr.o"
@@ -83,8 +83,8 @@ if [ ! -f "$DYNARR_OBJ" ] || [ "$DYNARR_SRC" -nt "$DYNARR_OBJ" ]; then
 fi
 
 # check and build neobuild.o if necessary
-NEOBUILD_SRC="release/neobuild.c"
-NEOBUILD_OBJ="release/neobuild.o"
+NEOBUILD_SRC="buildsysdep/neobuild.c"
+NEOBUILD_OBJ="buildsysdep/neobuild.o"
 
 if [ ! -f "$NEOBUILD_OBJ" ] || [ "$NEOBUILD_SRC" -nt "$NEOBUILD_OBJ" ]; then
     echo "compiling neobuild.o"
