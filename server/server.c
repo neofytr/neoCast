@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <errno.h>
 #include <sys/socket.h>
@@ -24,11 +25,9 @@
 #define MAX_LOGIN_ATTEMPTS 3
 #define BACKLOG 5
 
-// Enhanced logging macro
 #define LOG_ERROR(msg, ...) fprintf(stderr, "[ERROR] " msg "\n", ##__VA_ARGS__)
 #define LOG_INFO(msg, ...) fprintf(stdout, "[INFO] " msg "\n", ##__VA_ARGS__)
 
-// Function declarations with error handling improvements
 static void usage_error(void);
 static ssize_t safe_read(int fd, char *buffer, size_t buffer_size);
 static ssize_t safe_write(int fd, const char *buffer, size_t buffer_size);
@@ -38,7 +37,6 @@ static bool authenticate_user(const char *username, const char *password);
 static bool drop_privileges(const char *username);
 static void cleanup_and_close(int client_fd, int master_fd, pid_t child_pid);
 
-// Safe read with timeout and non-blocking behavior
 static ssize_t safe_read(int fd, char *buffer, size_t buffer_size)
 {
     struct timeval timeout;
@@ -74,7 +72,6 @@ static ssize_t safe_read(int fd, char *buffer, size_t buffer_size)
     return bytes_read;
 }
 
-// Safe write with error handling
 static ssize_t safe_write(int fd, const char *buffer, size_t buffer_size)
 {
     ssize_t total_written = 0;
@@ -97,7 +94,6 @@ static ssize_t safe_write(int fd, const char *buffer, size_t buffer_size)
     return total_written;
 }
 
-// Receive from client with protocol-aware termination
 static char *receive_from_client(int client_fd)
 {
     char *buffer = malloc(MAX_STRLEN + 1);
@@ -116,7 +112,6 @@ static char *receive_from_client(int client_fd)
         return NULL;
     }
 
-    // Trim trailing whitespace and newlines
     while (bytes_read > 0 && (buffer[bytes_read - 1] == '\r' ||
                               buffer[bytes_read - 1] == '\n' ||
                               buffer[bytes_read - 1] == ' '))
@@ -127,7 +122,6 @@ static char *receive_from_client(int client_fd)
     return buffer;
 }
 
-// Send to client with protocol-aware termination
 static bool send_to_client(int client_fd, const char *msg)
 {
     if (!msg)
@@ -140,11 +134,8 @@ static bool send_to_client(int client_fd, const char *msg)
     return result > 0;
 }
 
-// Authentication (simplified for demonstration)
 static bool authenticate_user(const char *username, const char *password)
 {
-    // SECURITY NOTE: This is a simplified authentication
-    // In production, use more secure methods like PAM
     struct spwd *shadow_entry = getspnam(username);
     if (!shadow_entry)
     {
@@ -156,7 +147,6 @@ static bool authenticate_user(const char *username, const char *password)
     return encrypted && !strcmp(encrypted, shadow_entry->sp_pwdp);
 }
 
-// Drop privileges for the authenticated user
 static bool drop_privileges(const char *username)
 {
     struct passwd *pw = getpwnam(username);
@@ -166,14 +156,14 @@ static bool drop_privileges(const char *username)
         return false;
     }
 
-    // Change to user's home directory
+    // change to user's home directory
     if (chdir(pw->pw_dir) != 0)
     {
         LOG_ERROR("Failed to change directory");
         return false;
     }
 
-    // Set group and user IDs
+    // set group and user IDs
     if (setgid(pw->pw_gid) != 0 || setuid(pw->pw_uid) != 0)
     {
         LOG_ERROR("Failed to set user/group IDs");
@@ -183,7 +173,6 @@ static bool drop_privileges(const char *username)
     return true;
 }
 
-// Cleanup resources
 static void cleanup_and_close(int client_fd, int master_fd, pid_t child_pid)
 {
     if (child_pid > 0)
@@ -198,7 +187,6 @@ static void cleanup_and_close(int client_fd, int master_fd, pid_t child_pid)
         close(client_fd);
 }
 
-// Client connection handler
 void *client_handler(void *arg)
 {
     long long client_fd = (long long)arg;
@@ -206,7 +194,6 @@ void *client_handler(void *arg)
     pid_t child_pid = -1;
     char *username = NULL;
 
-    // Receive username
     username = receive_from_client(client_fd);
     if (!username)
     {
@@ -218,11 +205,9 @@ void *client_handler(void *arg)
 
     LOG_INFO("Received username: %s", username);
 
-    // Authentication attempts
     bool authenticated = false;
     for (int attempts = 0; attempts < MAX_LOGIN_ATTEMPTS; attempts++)
     {
-        // Request and receive password
         send_to_client(client_fd, "PASSWORD_REQUEST");
         char *password = receive_from_client(client_fd);
 
@@ -254,7 +239,6 @@ void *client_handler(void *arg)
         return NULL;
     }
 
-    // Fork pseudo-terminal
     child_pid = forkpty(&master_fd, NULL, NULL, NULL);
 
     if (child_pid < 0)
@@ -266,9 +250,9 @@ void *client_handler(void *arg)
         return NULL;
     }
 
-    if (child_pid == 0)
+    if (!child_pid)
     {
-        // Child process: drop privileges and execute shell
+        // child process: drop privileges and execute shell
         if (!drop_privileges(username))
         {
             LOG_ERROR("Failed to drop privileges");
@@ -286,7 +270,7 @@ void *client_handler(void *arg)
         exit(EXIT_FAILURE);
     }
 
-    // Parent process: relay data
+    // parent process: relay data
     fd_set read_fds;
     while (1)
     {
@@ -302,7 +286,7 @@ void *client_handler(void *arg)
             break;
         }
 
-        // Client to PTY
+        // client to PTY
         if (FD_ISSET(client_fd, &read_fds))
         {
             char *cmd = receive_from_client(client_fd);
@@ -314,7 +298,7 @@ void *client_handler(void *arg)
             free(cmd);
         }
 
-        // PTY to Client
+        // PTY to client
         if (FD_ISSET(master_fd, &read_fds))
         {
             char buffer[MAX_STRLEN];
@@ -345,7 +329,6 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    // Port parsing
     char *endptr;
     int port = strtol(argv[1], &endptr, 10);
     if (*endptr || port <= 0 || port > 65535)
@@ -354,7 +337,6 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    // Socket creation
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0)
     {
@@ -362,7 +344,6 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    // Socket options
     int opt = 1;
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0)
     {
@@ -371,13 +352,11 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    // Server address setup
     struct sockaddr_in server_addr = {0};
     server_addr.sin_family = AF_INET;
     server_addr.sin_addr.s_addr = INADDR_ANY;
     server_addr.sin_port = htons(port);
 
-    // Bind socket
     if (bind(server_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
     {
         LOG_ERROR("Bind failed: %s", strerror(errno));
@@ -385,7 +364,6 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    // Listen
     if (listen(server_fd, BACKLOG) < 0)
     {
         LOG_ERROR("Listen failed: %s", strerror(errno));
@@ -395,7 +373,6 @@ int main(int argc, char **argv)
 
     LOG_INFO("Server started on port %d", port);
 
-    // Accept connections
     while (1)
     {
         struct sockaddr_in client_addr;
@@ -408,7 +385,6 @@ int main(int argc, char **argv)
             continue;
         }
 
-        // Create detached thread for client
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);

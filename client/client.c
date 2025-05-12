@@ -1,5 +1,3 @@
-// Improved Remote Shell Client
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,16 +8,15 @@
 #include <arpa/inet.h>
 #include <termios.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <sys/select.h>
 
 #define MAX_STRLEN 4096
 #define LOOPBACK "127.0.0.1"
 
-// Logging macros
 #define LOG_ERROR(msg, ...) fprintf(stderr, "[ERROR] " msg "\n", ##__VA_ARGS__)
 #define LOG_INFO(msg, ...) fprintf(stdout, "[INFO] " msg "\n", ##__VA_ARGS__)
 
-// Safe read with timeout
 static ssize_t safe_read(int fd, char *buffer, size_t buffer_size)
 {
     struct timeval timeout;
@@ -55,7 +52,6 @@ static ssize_t safe_read(int fd, char *buffer, size_t buffer_size)
     return bytes_read;
 }
 
-// Safe write with error handling
 static ssize_t safe_write(int fd, const char *buffer, size_t buffer_size)
 {
     ssize_t total_written = 0;
@@ -78,7 +74,6 @@ static ssize_t safe_write(int fd, const char *buffer, size_t buffer_size)
     return total_written;
 }
 
-// Receive from server with protocol-aware termination
 static char *receive_from_server(int server_fd)
 {
     char *buffer = malloc(MAX_STRLEN + 1);
@@ -97,7 +92,6 @@ static char *receive_from_server(int server_fd)
         return NULL;
     }
 
-    // Trim trailing whitespace and newlines
     while (bytes_read > 0 && (buffer[bytes_read - 1] == '\r' ||
                               buffer[bytes_read - 1] == '\n' ||
                               buffer[bytes_read - 1] == ' '))
@@ -108,7 +102,6 @@ static char *receive_from_server(int server_fd)
     return buffer;
 }
 
-// Send to server with protocol-aware termination
 static bool send_to_server(int server_fd, const char *msg)
 {
     if (!msg)
@@ -121,7 +114,6 @@ static bool send_to_server(int server_fd, const char *msg)
     return result > 0;
 }
 
-// Read password securely without echoing
 static char *read_password(const char *prompt)
 {
     struct termios old_term, new_term;
@@ -133,18 +125,18 @@ static char *read_password(const char *prompt)
         return NULL;
     }
 
-    // Get the terminal attributes
+    // get the terminal attributes
     tcgetattr(STDIN_FILENO, &old_term);
     new_term = old_term;
 
-    // Disable echo
+    // disable echo
     new_term.c_lflag &= ~(ECHO | ICANON);
     tcsetattr(STDIN_FILENO, TCSANOW, &new_term);
 
     printf("%s", prompt);
     fflush(stdout);
 
-    // Read password
+    // read password
     if (fgets(password, MAX_STRLEN, stdin) == NULL)
     {
         LOG_ERROR("Failed to read password");
@@ -153,10 +145,10 @@ static char *read_password(const char *prompt)
         return NULL;
     }
 
-    // Restore terminal
+    // restore terminal
     tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
 
-    // Remove newline
+    // remove newline
     size_t len = strlen(password);
     if (len > 0 && password[len - 1] == '\n')
     {
@@ -167,7 +159,7 @@ static char *read_password(const char *prompt)
     return password;
 }
 
-// Interactive shell session
+// interactive shell session
 static int interactive_shell(int server_fd)
 {
     fd_set read_fds;
@@ -181,7 +173,7 @@ static int interactive_shell(int server_fd)
 
         int max_fd = (STDIN_FILENO > server_fd ? STDIN_FILENO : server_fd) + 1;
 
-        // Wait for activity on either stdin or server socket
+        // wait for activity on either stdin or server socket
         int activity = select(max_fd, &read_fds, NULL, NULL, NULL);
         if (activity < 0)
         {
@@ -189,7 +181,7 @@ static int interactive_shell(int server_fd)
             break;
         }
 
-        // Input from user to send to server
+        // input from user to send to server
         if (FD_ISSET(STDIN_FILENO, &read_fds))
         {
             ssize_t bytes_read = read(STDIN_FILENO, buffer, sizeof(buffer) - 1);
@@ -201,14 +193,14 @@ static int interactive_shell(int server_fd)
                 break;
         }
 
-        // Response from server
+        // response from server
         if (FD_ISSET(server_fd, &read_fds))
         {
             char *response = receive_from_server(server_fd);
             if (!response)
                 break;
 
-            // Check for protocol messages
+            // check for protocol messages
             if (strncmp(response, "ERROR", 5) == 0)
             {
                 LOG_ERROR("Server Error: %s", response);
@@ -216,7 +208,7 @@ static int interactive_shell(int server_fd)
                 break;
             }
 
-            // Print server response
+            // print server response
             printf("%s", response);
             free(response);
         }
@@ -234,30 +226,30 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    // Parse username and IP
+    // parse username and IP
     char username[MAX_STRLEN] = {0};
     char ip_addr[INET_ADDRSTRLEN] = {0};
     char *ptr = argv[1];
     int index = 0;
 
-    // Extract username
+    // extract username
     while (*ptr != '@' && *ptr != '\0')
     {
         username[index++] = *ptr++;
     }
     username[index] = '\0';
 
-    // Check for '@' symbol
+    // check for '@' symbol
     if (*ptr != '@')
     {
         LOG_ERROR("Invalid format: missing '@' symbol");
         return EXIT_FAILURE;
     }
 
-    // Skip the '@' symbol
+    // skip the '@' symbol
     ptr++;
 
-    // Extract IP address
+    // extract IP address
     index = 0;
     while (*ptr != '\0')
     {
@@ -265,13 +257,13 @@ int main(int argc, char **argv)
     }
     ip_addr[index] = '\0';
 
-    // Handle localhost
+    // handle localhost
     if (strcmp(ip_addr, "localhost") == 0)
     {
         strcpy(ip_addr, LOOPBACK);
     }
 
-    // Parse port number
+    // parse port number
     char *endptr;
     int port = strtol(argv[2], &endptr, 10);
     if (*endptr || port <= 0 || port > 65535)
@@ -280,20 +272,20 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    // Prepare server address
+    // prepare server address
     struct sockaddr_in server;
     memset(&server, 0, sizeof(struct sockaddr_in));
     server.sin_family = AF_INET;
     server.sin_port = htons(port);
 
-    // Convert IP address
+    // convert IP address
     if (inet_pton(AF_INET, ip_addr, &server.sin_addr) != 1)
     {
         LOG_ERROR("Invalid IPv4 %s: %s", ip_addr, strerror(errno));
         return EXIT_FAILURE;
     }
 
-    // Create socket
+    // create socket
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0)
     {
@@ -301,7 +293,7 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    // Connect to server
+    // connect to server
     if (connect(server_fd, (struct sockaddr *)&server, sizeof(struct sockaddr_in)) < 0)
     {
         LOG_ERROR("Couldn't connect to the server IPv4: %s Port: %d -> %s",
@@ -312,7 +304,7 @@ int main(int argc, char **argv)
 
     LOG_INFO("Connected to server at %s:%d", ip_addr, port);
 
-    // Send username
+    // send username
     if (!send_to_server(server_fd, username))
     {
         LOG_ERROR("Failed to send username");
@@ -320,11 +312,11 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    // Authentication loop
+    // authentication loop
     bool authenticated = false;
     for (int attempts = 0; attempts < 3; attempts++)
     {
-        // Receive password request
+        // receive password request
         char *server_response = receive_from_server(server_fd);
         if (!server_response || strcmp(server_response, "PASSWORD_REQUEST") != 0)
         {
@@ -335,7 +327,7 @@ int main(int argc, char **argv)
         }
         free(server_response);
 
-        // Prompt for password
+        // prompt for password
         char *password = read_password("Enter password: ");
         if (!password)
         {
@@ -343,7 +335,6 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
 
-        // Send password
         if (!send_to_server(server_fd, password))
         {
             LOG_ERROR("Failed to send password");
@@ -352,7 +343,7 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
 
-        // Receive authentication result
+        // receive authentication result
         char *auth_response = receive_from_server(server_fd);
         if (!auth_response)
         {
@@ -371,13 +362,12 @@ int main(int argc, char **argv)
             break;
         }
 
-        // Authentication failed
         LOG_ERROR("Authentication failed: %s", auth_response);
         free(password);
         free(auth_response);
     }
 
-    // Exit if authentication failed
+    // exit if authentication failed
     if (!authenticated)
     {
         LOG_ERROR("Max login attempts reached");
@@ -385,10 +375,10 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    // Start interactive shell session
+    // start interactive shell session
     int result = interactive_shell(server_fd);
 
-    // Cleanup
+    // cleanup
     close(server_fd);
     return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
