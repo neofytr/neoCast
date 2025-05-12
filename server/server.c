@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <pty.h>
 #include <sys/select.h>
+#include <sys/wait.h>
 
 #include <stdbool.h>
 #include <shadow.h>
@@ -16,17 +17,32 @@
 
 #include <pwd.h>
 #include <sys/types.h>
+#include <signal.h>
 
+// Maximum length for input strings
 #define MAX_STRLEN 4096
+// Maximum number of login attempts
+#define MAX_LOGIN_ATTEMPTS 3
+// Number of connections the server can queue
 #define BACKLOG 5
 
+// Function declarations
+static void usage_error(void);
+static char *receive_from_client(int client_fd);
+static bool authenticate_user(const char *username, const char *password);
+static bool drop_privileges(const char *username);
+static void send_to_client(int client_fd, const char *msg);
+void *client_handler(void *arg);
+static void cleanup_and_close(int client_fd, int master_fd, pid_t child_pid, const char *username);
+
+// print usage instructions for incorrect command-line arguments
 static void usage_error(void)
 {
     fprintf(stderr, "[ERROR] -> Incorrect Usage\n");
     fprintf(stderr, "Correct Usage -> ./server port\n");
 }
 
-// function to receive data from client
+// receive data from client with proper error handling and termination detection
 static char *receive_from_client(int client_fd)
 {
     char *buffer = malloc(MAX_STRLEN + 1);
@@ -52,7 +68,7 @@ static char *receive_from_client(int client_fd)
 
         if (!bytes_received)
         {
-            // connection closed by client
+            // Connection closed by client
             fprintf(stderr, "[ERROR] -> Connection closed by client\n");
             free(buffer);
             return NULL;
@@ -71,49 +87,66 @@ static char *receive_from_client(int client_fd)
         }
     }
 
-    // if we've read MAX_STRLEN without finding \r\n
+    // we've read MAX_STRLEN without finding \r\n
     fprintf(stderr, "[ERROR] -> Message too long or missing terminator\n");
     free(buffer);
     return NULL;
 }
 
+// authenticate user by comparing hashed password from shadow file
 static bool authenticate_user(const char *username, const char *password)
 {
     // get the user's shadow entry (which has the hashed password)
     struct spwd *shadow_entry = getspnam(username);
     if (!shadow_entry)
-        return false; // return 0 if user not found
+    {
+        fprintf(stderr, "[ERROR] -> User not found in shadow file\n");
+        return false;
+    }
 
     // hash the provided password using the same salt from shadow_entry
     char *encrypted = crypt(password, shadow_entry->sp_pwdp);
 
-    // compare the new hash with the stored hash; return 1 if they match
+    // compare the new hash with the stored hash
     return encrypted && !strcmp(encrypted, shadow_entry->sp_pwdp);
 }
 
+// drop privileges to the specified user
 static bool drop_privileges(const char *username)
 {
     // get the passwd entry for the given username
     struct passwd *pw = getpwnam(username);
     if (!pw)
-        return false; // return error if user not found
+    {
+        fprintf(stderr, "[ERROR] -> User not found in passwd file\n");
+        return false;
+    }
 
     // change to the user's home directory
-    if (chdir(pw->pw_dir))
+    if (chdir(pw->pw_dir) != 0)
+    {
+        fprintf(stderr, "[ERROR] -> Failed to change directory to user's home: %s\n", strerror(errno));
         return false;
+    }
 
     // set the group id to the user's group id
-    if (setgid(pw->pw_gid))
+    if (setgid(pw->pw_gid) != 0)
+    {
+        fprintf(stderr, "[ERROR] -> Failed to set group id: %s\n", strerror(errno));
         return false;
+    }
 
     // set the user id to the user's id
-    if (setuid(pw->pw_uid))
+    if (setuid(pw->pw_uid) != 0)
+    {
+        fprintf(stderr, "[ERROR] -> Failed to set user id: %s\n", strerror(errno));
         return false;
+    }
 
-    // success
     return true;
 }
 
+// send a message to the client with error handling
 static void send_to_client(int client_fd, const char *msg)
 {
     size_t size = strlen(msg);
@@ -132,130 +165,171 @@ static void send_to_client(int client_fd, const char *msg)
     }
 }
 
+// cleanup function to close file descriptors and kill child process
+static void cleanup_and_close(int client_fd, int master_fd, pid_t child_pid, const char *username)
+{
+    // kill the child process if it exists
+    if (child_pid > 0)
+    {
+        kill(child_pid, SIGTERM);
+        // wait for the child to terminate
+        waitpid(child_pid, NULL, 0);
+    }
+
+    // close file descriptors
+    if (master_fd >= 0)
+    {
+        close(master_fd);
+    }
+    if (client_fd >= 0)
+    {
+        close(client_fd);
+    }
+
+    // free username if it exists
+    if (username)
+    {
+        free((char *)username);
+    }
+}
+
+// handle individual client connections
 void *client_handler(void *arg)
 {
     long long client_fd = (long long)arg;
+    const char *username = NULL;
+    int master_fd = -1;
+    pid_t child_pid = -1;
 
     // receive username
-    const char *username = receive_from_client(client_fd);
+    username = receive_from_client(client_fd);
     if (!username)
     {
         send_to_client(client_fd, "ERROR 100\r\n"); // couldn't read username
         close(client_fd);
+        return NULL;
     }
 
     // authenticate
     bool verified = false;
-    for (int tries = 1; tries <= 3; tries++)
+    for (int tries = 1; tries <= MAX_LOGIN_ATTEMPTS; tries++)
     {
         const char *password = receive_from_client(client_fd);
         if (!password)
         {
             send_to_client(client_fd, "ERROR 101\r\n"); // couldn't read password
-            close(client_fd);
+            cleanup_and_close(client_fd, master_fd, child_pid, username);
+            return NULL;
         }
 
         if (!authenticate_user(username, password))
         {
             send_to_client(client_fd, "ERROR 102\r\n"); // invalid password
+            free((char *)password);
         }
         else
         {
             verified = true;
+            free((char *)password);
+            break;
         }
-
-        free(password);
     }
 
     if (!verified)
     {
-        send_to_client(client_fd, "ERROR 103\r\n"); // closing connection; all tries wasted
-        close(client_fd);
-        free(username);
-    }
-
-    int master_fd;
-    pid_t pid = forkpty(&master_fd, NULL, NULL, NULL);
-
-    if (pid < 0)
-    {
-        fprintf(stderr, "[ERROR] -> Couldn't fork a pseudo-terminal: %s\n", strerror(errno));
+        send_to_client(client_fd, "ERROR 103\r\n"); // all login attempts exhausted
+        cleanup_and_close(client_fd, master_fd, child_pid, username);
         return NULL;
     }
 
-    if (!pid)
-    {
-        // this is the child (slave)
+    // fork a pseudo-terminal
+    child_pid = forkpty(&master_fd, NULL, NULL, NULL);
 
-        // drop privileges to the given user
-        if (!drop_privileges)
+    if (child_pid < 0)
+    {
+        fprintf(stderr, "[ERROR] -> Couldn't fork a pseudo-terminal: %s\n", strerror(errno));
+        send_to_client(client_fd, "ERROR 104\r\n");
+        cleanup_and_close(client_fd, master_fd, child_pid, username);
+        return NULL;
+    }
+
+    if (child_pid == 0)
+    {
+        // child process (slave)
+        // drop privileges to the authenticated user
+        if (!drop_privileges(username))
         {
-            send_to_client(client_fd, "ERROR 104\r\n"); // couldn't drop privileges to the user; retry; closing connection
-            close(client_fd);
-            free(username);
-            return NULL;
+            send_to_client(client_fd, "ERROR 105\r\n"); // Couldn't drop privileges
+            exit(EXIT_FAILURE);
         }
 
-        // replace with the login shell of the user
+        // get user's login shell
         struct passwd *pw = getpwnam(username);
         if (!pw)
         {
-            send_to_client(client_fd, "ERROR 105\r\n"); // couldn't get the login shell of the user; closing connection
-            free(username);
-            close(client_fd);
-            return NULL;
+            send_to_client(client_fd, "ERROR 106\r\n"); // Couldn't get user's login shell
+            exit(EXIT_FAILURE);
         }
 
-        free(username);
-        username = NULL;
+        // execute user's login shell
         execl(pw->pw_shell, pw->pw_shell, "--login", (char *)NULL);
 
-        // will reach here only if there is an execl error
-        send_to_client(client_fd, "ERROR 106\r\n"); // couldn't spawn login shell of the user
+        // will reach here only if execl fails
+        send_to_client(client_fd, "ERROR 107\r\n");
+        exit(EXIT_FAILURE);
     }
-    else
-    {
-        // parent; relay data between client and server shell
-        fd_set fds;
-        while (true)
-        {
-            FD_ZERO(&fds);
-            FD_SET(client_fd, &fds);
-            FD_SET(master_fd, &fds);
-            int maxfd = (client_fd > master_fd ? client_fd : master_fd) + 1;
 
-            int ret = select(maxfd, &fds, NULL, NULL, NULL);
-            if (ret < 0)
+    // parent process: relay data between client and shell
+    fd_set fds;
+    while (true)
+    {
+        FD_ZERO(&fds);
+        FD_SET(client_fd, &fds);
+        FD_SET(master_fd, &fds);
+        int maxfd = (client_fd > master_fd ? client_fd : master_fd) + 1;
+
+        int ret = select(maxfd, &fds, NULL, NULL, NULL);
+        if (ret < 0)
+        {
+            fprintf(stderr, "[ERROR] -> select call failed: %s\n", strerror(errno));
+            send_to_client(client_fd, "ERROR 108\r\n");
+            break;
+        }
+
+        // client -> PTY
+        if (FD_ISSET(client_fd, &fds))
+        {
+            const char *msg = receive_from_client(client_fd);
+            if (msg)
             {
-                fprintf(stderr, "[ERROR] -> select call failed: %s\n", strerror(errno));
-                send_to_client(client_fd, "ERROR 107\r\n");
-                // now kill the shell process
+                write(master_fd, msg, strlen(msg));
+                write(master_fd, "\n", 1);
+                free((char *)msg);
+            }
+            else
+            {
                 break;
             }
+        }
 
-            // client -> pty
-            if (FD_ISSET(client_fd, &fds))
+        // PTY -> Client
+        if (FD_ISSET(master_fd, &fds))
+        {
+            char buffer[MAX_STRLEN];
+            ssize_t bytes_read = read(master_fd, buffer, sizeof(buffer) - 1);
+            if (bytes_read > 0)
             {
-                const char *msg = receive_from_client(client_fd);
-                send_to_client(master_fd, msg);
-                free(msg);
+                buffer[bytes_read] = '\0';
+                send_to_client(client_fd, buffer);
             }
-
-            if (FD_ISSET(master_fd, &fds))
+            else
             {
-                const char *msg = receive_from_client(master_fd);
-                send_to_client(client_fd, msg);
-                free(msg);
+                break;
             }
         }
     }
 
-    // cleanup
-    if (username)
-    {
-        free(username);
-    }
-    close(client_fd);
+    cleanup_and_close(client_fd, master_fd, child_pid, username);
     return NULL;
 }
 
@@ -270,7 +344,7 @@ int main(int argc, char **argv)
     // parse port number
     char *endptr;
     int port = strtol(argv[1], &endptr, 10);
-    if (*endptr)
+    if (*endptr || port <= 0 || port > 65535)
     {
         fprintf(stderr, "[ERROR] -> Invalid port number: %s\n", argv[1]);
         return EXIT_FAILURE;
@@ -324,7 +398,7 @@ int main(int argc, char **argv)
         struct sockaddr_in client_addr;
 
         // accept client connection
-        long long client_fd = (long long)accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        long long client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0)
         {
             fprintf(stderr, "[ERROR] -> Failed to accept connection: %s\n", strerror(errno));
@@ -336,12 +410,16 @@ int main(int argc, char **argv)
         pthread_attr_init(&attr);
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-        pthread_t client;
-        pthread_create(&client, &attr, client_handler, (void *)client_fd);
+        pthread_t client_thread;
+        if (pthread_create(&client_thread, &attr, client_handler, (void *)client_fd) != 0)
+        {
+            fprintf(stderr, "[ERROR] -> Failed to create client thread\n");
+            close(client_fd);
+        }
 
         pthread_attr_destroy(&attr);
 
-        // get client's IP address
+        // get client's IP address (optional, can be used for logging)
         char client_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
     }
