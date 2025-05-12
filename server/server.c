@@ -7,6 +7,15 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <pty.h>
+#include <sys/select.h>
+
+#include <stdbool.h>
+#include <shadow.h>
+#include <crypt.h>
+
+#include <pwd.h>
+#include <sys/types.h>
 
 #define MAX_STRLEN 4096
 #define BACKLOG 5
@@ -68,32 +77,123 @@ static char *receive_from_client(int client_fd)
     return NULL;
 }
 
+static bool authenticate_user(const char *username, const char *password)
+{
+    // get the user's shadow entry (which has the hashed password)
+    struct spwd *shadow_entry = getspnam(username);
+    if (!shadow_entry)
+        return false; // return 0 if user not found
+
+    // hash the provided password using the same salt from shadow_entry
+    char *encrypted = crypt(password, shadow_entry->sp_pwdp);
+
+    // compare the new hash with the stored hash; return 1 if they match
+    return encrypted && !strcmp(encrypted, shadow_entry->sp_pwdp);
+}
+
+static bool drop_privileges(const char *username)
+{
+    // get the passwd entry for the given username
+    struct passwd *pw = getpwnam(username);
+    if (!pw)
+        return false; // return error if user not found
+
+    // change to the user's home directory
+    if (chdir(pw->pw_dir))
+        return false;
+
+    // set the group id to the user's group id
+    if (setgid(pw->pw_gid))
+        return false;
+
+    // set the user id to the user's id
+    if (setuid(pw->pw_uid))
+        return false;
+
+    // success
+    return true;
+}
+
+static void send_to_client(int client_fd, const char *msg)
+{
+    size_t size = strlen(msg);
+    size_t sent = 0;
+    ssize_t bytes_sent;
+
+    while (sent < size)
+    {
+        bytes_sent = write(client_fd, msg + sent, size - sent);
+        if (bytes_sent < 0)
+        {
+            fprintf(stderr, "[ERROR] -> Failed to send data: %s\n", strerror(errno));
+            return;
+        }
+        sent += bytes_sent;
+    }
+}
+
 void *client_handler(void *arg)
 {
     long long client_fd = (long long)arg;
 
-    // receive hello message
-    char *hello_msg = receive_from_client(client_fd);
-    if (!hello_msg)
-    {
-        close(client_fd);
-    }
-
     // receive username
-    char *username = receive_from_client(client_fd);
+    const char *username = receive_from_client(client_fd);
     if (!username)
     {
-        free(hello_msg);
+        send_to_client(client_fd, "ERROR 100\r\n"); // couldn't read username
         close(client_fd);
     }
 
-    // display the received information
-    printf("Received from client - Message: %s, Username: %s\n", hello_msg, username);
+    // authenticate
+    bool verified = false;
+    for (int tries = 1; tries <= 3; tries++)
+    {
+        const char *password = receive_from_client(client_fd);
+        if (!password)
+        {
+            send_to_client(client_fd, "ERROR 101\r\n"); // couldn't read password
+            close(client_fd);
+        }
+
+        if (!authenticate_user(username, password))
+        {
+            send_to_client(client_fd, "ERROR 102\r\n"); // invalid password
+        }
+        else
+        {
+            verified = true;
+        }
+
+        free(password);
+    }
+
+    if (!verified)
+    {
+        send_to_client(client_fd, "ERROR 103\r\n"); // closing connection; all tries wasted
+        close(client_fd);
+        free(username);
+    }
+
+    int master_fd;
+    pid_t pid = forkpty(&master_fd, NULL, NULL, NULL);
+
+    if (pid < 0)
+    {
+        fprintf(stderr, "[ERROR] -> Couldn't fork a pseudo-terminal: %s\n", strerror(errno));
+        return NULL;
+    }
+
+    if (!pid)
+    {
+        // this is the child (slave)
+
+        // replace with a shell program
+    }
 
     // cleanup
-    free(hello_msg);
     free(username);
     close(client_fd);
+    return NULL;
 }
 
 int main(int argc, char **argv)
