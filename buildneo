@@ -1,0 +1,107 @@
+#!/bin/bash
+
+# parse command line arguments
+clean_mode=false
+
+while getopts "c" opt; do
+  case ${opt} in
+    c )
+      clean_mode=true
+      ;;
+    \? )
+      echo "Usage: $0 [-c] [<source_file.c>]"
+      echo "  -c: clean all compiled objects and binaries"
+      exit 1
+      ;;
+  esac
+done
+
+shift $((OPTIND -1))
+
+# if clean mode is active, remove all compiled files
+if [ "$clean_mode" = true ]; then
+    echo "cleaning all compiled objects and binaries..."
+    rm -rf release/strix/binaries/*
+    rm -rf release/dynarr/binaries/*
+    rm -f release/*.o
+    rm -f release/neobuild.o
+    echo "clean complete."
+    exit 0
+fi
+
+# check if a .c file is provided as an argument when not in clean mode
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 [-c] [<source_file.c>]"
+    echo "  -c: clean all compiled objects and binaries"
+    exit 1
+fi
+
+SOURCE_FILE="$1"
+OUTPUT_FILE="${SOURCE_FILE%.c}"
+
+# determine the c compiler
+if command -v gcc &>/dev/null; then
+    CC=gcc
+elif command -v clang &>/dev/null; then
+    CC=clang
+else
+    echo "error: no gcc or clang compiler found."
+    exit 1
+fi
+
+echo "using compiler: $CC"
+
+# ensure directories exist
+mkdir -p release/strix/binaries
+mkdir -p release/dynarr/binaries
+mkdir -p release
+
+# check and build strix.o if necessary
+STRIX_SRC="release/strix/source/main.c"
+STRIX_OBJ="release/strix/binaries/strix.o"
+
+if [ ! -f "$STRIX_OBJ" ] || [ "$STRIX_SRC" -nt "$STRIX_OBJ" ]; then
+    echo "compiling strix.o"
+    $CC -c "$STRIX_SRC" -o "$STRIX_OBJ" -O3 -march=native
+    if [ $? -ne 0 ]; then
+        echo "failed to compile strix.o"
+        exit 1
+    fi
+fi
+
+# check and build dynarr.o if necessary
+DYNARR_SRC="release/dynarr/src/dynarr.c"
+DYNARR_OBJ="release/dynarr/binaries/dynarr.o"
+
+if [ ! -f "$DYNARR_OBJ" ] || [ "$DYNARR_SRC" -nt "$DYNARR_OBJ" ]; then
+    echo "compiling dynarr.o"
+    $CC -c "$DYNARR_SRC" -o "$DYNARR_OBJ" -O3 -march=native
+    if [ $? -ne 0 ]; then
+        echo "failed to compile dynarr.o"
+        exit 1
+    fi
+fi
+
+# check and build neobuild.o if necessary
+NEOBUILD_SRC="release/neobuild.c"
+NEOBUILD_OBJ="release/neobuild.o"
+
+if [ ! -f "$NEOBUILD_OBJ" ] || [ "$NEOBUILD_SRC" -nt "$NEOBUILD_OBJ" ]; then
+    echo "compiling neobuild.o"
+    $CC -c "$NEOBUILD_SRC" -o "$NEOBUILD_OBJ" -O3 -march=native
+    if [ $? -ne 0 ]; then
+        echo "failed to compile neobuild.o"
+        exit 1
+    fi
+fi
+
+# compile the provided .c file
+echo "compiling $SOURCE_FILE"
+$CC "$SOURCE_FILE" "$STRIX_OBJ" "$DYNARR_OBJ" "$NEOBUILD_OBJ" -o "$OUTPUT_FILE" -lm -O3 -march=native
+
+if [ $? -eq 0 ]; then
+    echo "compilation successful: $OUTPUT_FILE"
+else
+    echo "compilation failed."
+    exit 1
+fi
