@@ -11,24 +11,50 @@
 #include <stdbool.h>
 #include <sys/select.h>
 
-#define MAX_STRLEN 4096
+#define INITIAL_BUFFER_SIZE 4096
 #define LOOPBACK "127.0.0.1"
 
 #define LOG_ERROR(msg, ...) fprintf(stderr, "[ERROR] " msg "\n", ##__VA_ARGS__)
 #define LOG_INFO(msg, ...) fprintf(stdout, "[INFO] " msg "\n", ##__VA_ARGS__)
 
-static ssize_t safe_read(int fd, char *buffer, size_t buffer_size)
+/* Function prototypes */
+static ssize_t safe_read(int fd, char *buffer, size_t buffer_size, int timeout_seconds);
+static ssize_t safe_write(int fd, const char *buffer, size_t buffer_size);
+static char *dynamic_read(int fd, int timeout_seconds);
+static bool send_message(int fd, const char *msg);
+static char *read_password(const char *prompt);
+static int interactive_shell(int server_fd);
+static bool get_shell_prompt(int server_fd);
+static void restore_terminal(struct termios *old_term);
+static void prepare_terminal_raw(struct termios *old_term);
+
+/**
+ * Reads data from a file descriptor with timeout protection
+ *
+ * @param fd File descriptor to read from
+ * @param buffer Buffer to store data
+ * @param buffer_size Maximum size of the buffer
+ * @param timeout_seconds Timeout in seconds (0 for no timeout)
+ * @return Number of bytes read, 0 on timeout, -1 on error
+ */
+static ssize_t safe_read(int fd, char *buffer, size_t buffer_size, int timeout_seconds)
 {
+    if (!buffer || buffer_size == 0)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
     struct timeval timeout;
     fd_set read_fds;
 
     FD_ZERO(&read_fds);
     FD_SET(fd, &read_fds);
 
-    timeout.tv_sec = 10; // 10-second timeout
+    timeout.tv_sec = timeout_seconds;
     timeout.tv_usec = 0;
 
-    int ready = select(fd + 1, &read_fds, NULL, NULL, &timeout);
+    int ready = select(fd + 1, &read_fds, NULL, NULL, timeout_seconds ? &timeout : NULL);
 
     if (ready < 0)
     {
@@ -38,8 +64,7 @@ static ssize_t safe_read(int fd, char *buffer, size_t buffer_size)
 
     if (ready == 0)
     {
-        LOG_ERROR("Read timeout");
-        return 0;
+        return 0; // Timeout
     }
 
     ssize_t bytes_read = read(fd, buffer, buffer_size - 1);
@@ -52,8 +77,22 @@ static ssize_t safe_read(int fd, char *buffer, size_t buffer_size)
     return bytes_read;
 }
 
+/**
+ * Writes data to a file descriptor with retry on interruption
+ *
+ * @param fd File descriptor to write to
+ * @param buffer Data to write
+ * @param buffer_size Size of the data
+ * @return Number of bytes written, -1 on error
+ */
 static ssize_t safe_write(int fd, const char *buffer, size_t buffer_size)
 {
+    if (!buffer)
+    {
+        errno = EINVAL;
+        return -1;
+    }
+
     ssize_t total_written = 0;
 
     while (total_written < buffer_size)
@@ -74,50 +113,119 @@ static ssize_t safe_write(int fd, const char *buffer, size_t buffer_size)
     return total_written;
 }
 
-static char *receive_from_server(int server_fd)
+/**
+ * Dynamically reads data from a file descriptor with automatic buffer resizing
+ *
+ * @param fd File descriptor to read from
+ * @param timeout_seconds Timeout in seconds (0 for no timeout)
+ * @return Dynamically allocated buffer with data (caller must free), NULL on error
+ */
+static char *dynamic_read(int fd, int timeout_seconds)
 {
-    char *buffer = malloc(MAX_STRLEN + 1);
+    size_t buffer_size = INITIAL_BUFFER_SIZE;
+    size_t bytes_read_total = 0;
+    char *buffer = malloc(buffer_size);
+
     if (!buffer)
     {
         LOG_ERROR("Memory allocation failed");
         return NULL;
     }
 
-    memset(buffer, 0, MAX_STRLEN + 1);
-    ssize_t bytes_read = safe_read(server_fd, buffer, MAX_STRLEN);
-
-    if (bytes_read <= 0)
+    while (1)
     {
-        free(buffer);
-        return NULL;
+        if (bytes_read_total >= buffer_size - 1)
+        {
+            size_t new_size = buffer_size * 2;
+            char *new_buffer = realloc(buffer, new_size);
+            if (!new_buffer)
+            {
+                LOG_ERROR("Memory reallocation failed");
+                free(buffer);
+                return NULL;
+            }
+            buffer = new_buffer;
+            buffer_size = new_size;
+        }
+
+        ssize_t bytes_read = safe_read(fd, buffer + bytes_read_total,
+                                       buffer_size - bytes_read_total,
+                                       timeout_seconds);
+
+        if (bytes_read < 0)
+        {
+            free(buffer);
+            return NULL;
+        }
+
+        if (!bytes_read)
+        { // EOF or timeout
+            break;
+        }
+
+        bytes_read_total += bytes_read;
+
+        // stop reading on a newline
+        if (buffer[bytes_read_total - 1] == '\n')
+        {
+            break;
+        }
     }
 
-    while (bytes_read > 0 && (buffer[bytes_read - 1] == '\r' ||
-                              buffer[bytes_read - 1] == '\n' ||
-                              buffer[bytes_read - 1] == ' '))
+    // trim trailing whitespace
+    while (bytes_read_total > 0 &&
+           (buffer[bytes_read_total - 1] == '\r' ||
+            buffer[bytes_read_total - 1] == '\n' ||
+            buffer[bytes_read_total - 1] == ' '))
     {
-        buffer[--bytes_read] = '\0';
+        buffer[--bytes_read_total] = '\0';
     }
 
+    buffer[bytes_read_total] = '\0';
     return buffer;
 }
 
-static bool send_to_server(int server_fd, const char *msg)
+/**
+ * Sends a message to the specified file descriptor with proper newline handling
+ *
+ * @param fd File descriptor to send to
+ * @param msg Message to send
+ * @return true on success, false on failure
+ */
+static bool send_message(int fd, const char *msg)
 {
     if (!msg)
         return false;
 
-    char buffer[MAX_STRLEN + 3]; // Room for message + \r\n\0
-    snprintf(buffer, sizeof(buffer), "%s\r\n", msg);
+    // add CRLF to the message
+    size_t msg_len = strlen(msg);
+    char *buffer = malloc(msg_len + 3); // Room for message + \r\n\0
 
-    ssize_t result = safe_write(server_fd, buffer, strlen(buffer));
+    if (!buffer)
+    {
+        LOG_ERROR("Memory allocation failed");
+        return false;
+    }
+
+    strcpy(buffer, msg);
+    strcat(buffer, "\r\n");
+
+    ssize_t result = safe_write(fd, buffer, strlen(buffer));
+    free(buffer);
+
     return result > 0;
 }
 
+/**
+ * Securely reads a password without echoing characters
+ *
+ * @param prompt Text to display as password prompt
+ * @return Dynamically allocated password string (caller must free), NULL on error
+ */
 static char *read_password(const char *prompt)
 {
     struct termios old_term, new_term;
-    char *password = malloc(MAX_STRLEN);
+    char *password = malloc(INITIAL_BUFFER_SIZE);
 
     if (!password)
     {
@@ -126,18 +234,29 @@ static char *read_password(const char *prompt)
     }
 
     // get the terminal attributes
-    tcgetattr(STDIN_FILENO, &old_term);
+    if (tcgetattr(STDIN_FILENO, &old_term) != 0)
+    {
+        LOG_ERROR("Failed to get terminal attributes: %s", strerror(errno));
+        free(password);
+        return NULL;
+    }
+
     new_term = old_term;
 
     // disable echo
     new_term.c_lflag &= ~(ECHO | ICANON);
-    tcsetattr(STDIN_FILENO, TCSANOW, &new_term);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &new_term) != 0)
+    {
+        LOG_ERROR("Failed to set terminal attributes: %s", strerror(errno));
+        free(password);
+        return NULL;
+    }
 
     printf("%s", prompt);
     fflush(stdout);
 
     // read password
-    if (fgets(password, MAX_STRLEN, stdin) == NULL)
+    if (fgets(password, INITIAL_BUFFER_SIZE, stdin) == NULL)
     {
         LOG_ERROR("Failed to read password");
         tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
@@ -146,7 +265,11 @@ static char *read_password(const char *prompt)
     }
 
     // restore terminal
-    tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &old_term) != 0)
+    {
+        LOG_ERROR("Failed to restore terminal attributes: %s", strerror(errno));
+        // continue anyway as the password was already read
+    }
 
     // remove newline
     size_t len = strlen(password);
@@ -159,11 +282,98 @@ static char *read_password(const char *prompt)
     return password;
 }
 
-// interactive shell session
+/**
+ * Gets the initial shell prompt by sending a "cd ." command
+ *
+ * @param server_fd Socket connected to the server
+ * @return true on success, false on failure
+ */
+static bool get_shell_prompt(int server_fd)
+{
+    // send a dummy command to get the initial prompt
+    if (!send_message(server_fd, "cd ."))
+    {
+        return false;
+    }
+
+    // read and display the response (which includes the prompt)
+    char *response = dynamic_read(server_fd, 5);
+    if (!response)
+    {
+        return false;
+    }
+
+    printf("%s", response);
+    free(response);
+
+    return true;
+}
+
+/**
+ * Prepares the terminal for raw mode input
+ *
+ * @param old_term Structure to store original terminal settings
+ */
+static void prepare_terminal_raw(struct termios *old_term)
+{
+    struct termios new_term;
+
+    if (tcgetattr(STDIN_FILENO, old_term) != 0)
+    {
+        LOG_ERROR("Failed to get terminal attributes: %s", strerror(errno));
+        return;
+    }
+
+    new_term = *old_term;
+
+    // configure for raw mode
+    new_term.c_lflag &= ~(ICANON | ECHO | ECHOE | ECHOK | ECHONL | ISIG | IEXTEN);
+    new_term.c_iflag &= ~(IXON | ICRNL | INLCR | IGNCR);
+    new_term.c_oflag &= ~OPOST;
+
+    // set character timeout values
+    new_term.c_cc[VMIN] = 1;  // read at least 1 character
+    new_term.c_cc[VTIME] = 0; // no timeout
+
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &new_term) != 0)
+    {
+        LOG_ERROR("Failed to set terminal attributes: %s", strerror(errno));
+    }
+}
+
+/**
+ * Restores the terminal to original settings
+ *
+ * @param old_term Original terminal settings to restore
+ */
+static void restore_terminal(struct termios *old_term)
+{
+    if (tcsetattr(STDIN_FILENO, TCSANOW, old_term) != 0)
+    {
+        LOG_ERROR("Failed to restore terminal attributes: %s", strerror(errno));
+    }
+}
+
+/**
+ * Handles interactive shell session between user and server
+ *
+ * @param server_fd Socket connected to the server
+ * @return 0 on success, -1 on error
+ */
 static int interactive_shell(int server_fd)
 {
     fd_set read_fds;
-    char buffer[MAX_STRLEN];
+    char buffer[INITIAL_BUFFER_SIZE];
+    struct termios old_term;
+
+    // get initial shell prompt
+    if (!get_shell_prompt(server_fd))
+    {
+        LOG_ERROR("Failed to get initial shell prompt");
+    }
+
+    // set terminal to raw mode
+    prepare_terminal_raw(&old_term);
 
     while (true)
     {
@@ -177,6 +387,11 @@ static int interactive_shell(int server_fd)
         int activity = select(max_fd, &read_fds, NULL, NULL, NULL);
         if (activity < 0)
         {
+            if (errno == EINTR)
+            {
+                // interrupted system call, just retry
+                continue;
+            }
             LOG_ERROR("Select error: %s", strerror(errno));
             break;
         }
@@ -186,37 +401,70 @@ static int interactive_shell(int server_fd)
         {
             ssize_t bytes_read = read(STDIN_FILENO, buffer, sizeof(buffer) - 1);
             if (bytes_read <= 0)
+            {
+                if (bytes_read < 0)
+                {
+                    LOG_ERROR("Error reading from stdin: %s", strerror(errno));
+                }
                 break;
+            }
 
             buffer[bytes_read] = '\0';
-            if (!send_to_server(server_fd, buffer))
+
+            // handle special key combinations (like Ctrl+D)
+            if (bytes_read == 1 && buffer[0] == 4)
+            { // Ctrl+D
                 break;
+            }
+
+            // forward the input to server
+            if (safe_write(server_fd, buffer, bytes_read) < 0)
+            {
+                break;
+            }
         }
 
         // response from server
         if (FD_ISSET(server_fd, &read_fds))
         {
-            char *response = receive_from_server(server_fd);
-            if (!response)
-                break;
-
-            // check for protocol messages
-            if (strncmp(response, "ERROR", 5) == 0)
+            ssize_t bytes_read = safe_read(server_fd, buffer, sizeof(buffer), 0);
+            if (bytes_read <= 0)
             {
-                LOG_ERROR("Server Error: %s", response);
-                free(response);
+                if (bytes_read < 0)
+                {
+                    LOG_ERROR("Error reading from server: %s", strerror(errno));
+                }
+                else
+                {
+                    LOG_INFO("Server closed connection");
+                }
                 break;
             }
 
-            // print server response
-            printf("%s", response);
-            free(response);
+            // check for protocol messages
+            if (!strncmp(buffer, "ERROR", 5))
+            {
+                LOG_ERROR("Server Error: %s", buffer);
+                break;
+            }
+
+            if (safe_write(STDOUT_FILENO, buffer, bytes_read) < 0)
+            {
+                LOG_ERROR("Error writing to stdout: %s", strerror(errno));
+                break;
+            }
         }
     }
+
+    // restore terminal settings
+    restore_terminal(&old_term);
 
     return 0;
 }
 
+/**
+ * Main function - parse arguments and establish connection
+ */
 int main(int argc, char **argv)
 {
     if (argc != 3)
@@ -226,98 +474,108 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    // parse username and IP
-    char username[MAX_STRLEN] = {0};
-    char ip_addr[INET_ADDRSTRLEN] = {0};
-    char *ptr = argv[1];
-    int index = 0;
+    char *username = NULL;
+    char *ip_addr = NULL;
+    char *at_sign = strchr(argv[1], '@');
 
-    // extract username
-    while (*ptr != '@' && *ptr != '\0')
-    {
-        username[index++] = *ptr++;
-    }
-    username[index] = '\0';
-
-    // check for '@' symbol
-    if (*ptr != '@')
+    if (!at_sign)
     {
         LOG_ERROR("Invalid format: missing '@' symbol");
         return EXIT_FAILURE;
     }
 
-    // skip the '@' symbol
-    ptr++;
-
-    // extract IP address
-    index = 0;
-    while (*ptr != '\0')
+    size_t username_len = at_sign - argv[1];
+    username = malloc(username_len + 1);
+    if (!username)
     {
-        ip_addr[index++] = *ptr++;
+        LOG_ERROR("Memory allocation failed");
+        return EXIT_FAILURE;
     }
-    ip_addr[index] = '\0';
+    strncpy(username, argv[1], username_len);
+    username[username_len] = '\0';
 
-    // handle localhost
+    size_t ip_len = strlen(at_sign + 1);
+    ip_addr = malloc(ip_len + 1);
+    if (!ip_addr)
+    {
+        LOG_ERROR("Memory allocation failed");
+        free(username);
+        return EXIT_FAILURE;
+    }
+    strcpy(ip_addr, at_sign + 1);
+
     if (strcmp(ip_addr, "localhost") == 0)
     {
-        strcpy(ip_addr, LOOPBACK);
+        free(ip_addr);
+        ip_addr = strdup(LOOPBACK);
+        if (!ip_addr)
+        {
+            LOG_ERROR("Memory allocation failed");
+            free(username);
+            return EXIT_FAILURE;
+        }
     }
 
-    // parse port number
     char *endptr;
     int port = strtol(argv[2], &endptr, 10);
     if (*endptr || port <= 0 || port > 65535)
     {
         LOG_ERROR("Invalid port number: %s", argv[2]);
+        free(username);
+        free(ip_addr);
         return EXIT_FAILURE;
     }
 
-    // prepare server address
     struct sockaddr_in server;
     memset(&server, 0, sizeof(struct sockaddr_in));
     server.sin_family = AF_INET;
     server.sin_port = htons(port);
 
-    // convert IP address
     if (inet_pton(AF_INET, ip_addr, &server.sin_addr) != 1)
     {
         LOG_ERROR("Invalid IPv4 %s: %s", ip_addr, strerror(errno));
+        free(username);
+        free(ip_addr);
         return EXIT_FAILURE;
     }
 
-    // create socket
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0)
     {
         LOG_ERROR("Couldn't create a socket: %s", strerror(errno));
+        free(username);
+        free(ip_addr);
         return EXIT_FAILURE;
     }
 
-    // connect to server
     if (connect(server_fd, (struct sockaddr *)&server, sizeof(struct sockaddr_in)) < 0)
     {
         LOG_ERROR("Couldn't connect to the server IPv4: %s Port: %d -> %s",
                   ip_addr, port, strerror(errno));
         close(server_fd);
+        free(username);
+        free(ip_addr);
         return EXIT_FAILURE;
     }
 
     LOG_INFO("Connected to server at %s:%d", ip_addr, port);
 
-    // send username
-    if (!send_to_server(server_fd, username))
+    free(ip_addr);
+
+    if (!send_message(server_fd, username))
     {
         LOG_ERROR("Failed to send username");
         close(server_fd);
+        free(username);
         return EXIT_FAILURE;
     }
 
-    // authentication loop
+    free(username);
+
     bool authenticated = false;
     for (int attempts = 0; attempts < 3; attempts++)
     {
-        // receive password request
-        char *server_response = receive_from_server(server_fd);
+        char *server_response = dynamic_read(server_fd, 10);
         if (!server_response || strcmp(server_response, "PASSWORD_REQUEST") != 0)
         {
             LOG_ERROR("Invalid server response during authentication");
@@ -327,7 +585,6 @@ int main(int argc, char **argv)
         }
         free(server_response);
 
-        // prompt for password
         char *password = read_password("Enter password: ");
         if (!password)
         {
@@ -335,7 +592,7 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
 
-        if (!send_to_server(server_fd, password))
+        if (!send_message(server_fd, password))
         {
             LOG_ERROR("Failed to send password");
             free(password);
@@ -343,31 +600,29 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
 
-        // receive authentication result
-        char *auth_response = receive_from_server(server_fd);
+        memset(password, 0, strlen(password));
+        free(password);
+
+        char *auth_response = dynamic_read(server_fd, 10);
         if (!auth_response)
         {
             LOG_ERROR("Failed to receive authentication response");
-            free(password);
             close(server_fd);
             return EXIT_FAILURE;
         }
 
-        if (strcmp(auth_response, "AUTHENTICATED") == 0)
+        if (!strcmp(auth_response, "AUTHENTICATED"))
         {
             LOG_INFO("Authentication successful");
-            free(password);
             free(auth_response);
             authenticated = true;
             break;
         }
 
         LOG_ERROR("Authentication failed: %s", auth_response);
-        free(password);
         free(auth_response);
     }
 
-    // exit if authentication failed
     if (!authenticated)
     {
         LOG_ERROR("Max login attempts reached");
@@ -375,10 +630,8 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    // start interactive shell session
     int result = interactive_shell(server_fd);
 
-    // cleanup
     close(server_fd);
     return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
