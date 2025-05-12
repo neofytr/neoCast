@@ -1,13 +1,13 @@
 #include "../inc/client.h"
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include <arpa/inet.h> // for inet_pton
-#include <sys/socket.h>
-#include <string.h>
 #include <errno.h>
+#include <string.h>
 #include <unistd.h>
-#include <stdint.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 #define MAX_STRLEN (4096 + 1)
 #define LOOPBACK "127.0.0.1"
@@ -15,24 +15,24 @@
 static void usage_error(void)
 {
     fprintf(stderr, "[ERROR] -> Incorrect Usage\n");
-    fprintf(stderr, "Correct Usage -> ./client <username>@<ip_address> <port>\n");
+    fprintf(stderr, "Correct Usage -> ./client username@ipaddress port\n");
 }
 
 static void send_to_server(int server_fd, const char *msg)
 {
-    // use strlen to get the actual message length
-    int size = strlen(msg);
-    uintptr_t sent = 0;
-    while (size > 0)
+    size_t size = strlen(msg);
+    size_t sent = 0;
+    ssize_t bytes_sent;
+
+    while (sent < size)
     {
-        int bytes = write(server_fd, msg + sent, size);
-        if (bytes < 0)
+        bytes_sent = write(server_fd, msg + sent, size - sent);
+        if (bytes_sent < 0)
         {
-            fprintf(stderr, "[ERROR] -> Failed to send message: %s\n", strerror(errno));
+            fprintf(stderr, "[ERROR] -> Failed to send data: %s\n", strerror(errno));
             return;
         }
-        sent += bytes;
-        size -= bytes;
+        sent += bytes_sent;
     }
 }
 
@@ -47,31 +47,33 @@ int main(int argc, char **argv)
     char user[MAX_STRLEN];
     char ip_addr[INET_ADDRSTRLEN];
     char *ptr = argv[1];
-
     int index = 0;
-    while (*ptr && *ptr != '@')
+
+    // extract username
+    while (*ptr != '@' && *ptr != '\0')
     {
         user[index++] = *ptr++;
     }
-    user[index] = 0;
+    user[index] = '\0';
 
-    // check if we found the @ symbol
+    // check if we found the '@' symbol
     if (*ptr != '@')
     {
-        fprintf(stderr, "[ERROR] -> Invalid format. Use <username>@<ip_address>\n");
+        fprintf(stderr, "[ERROR] -> Invalid format: missing '@' symbol\n");
+        usage_error();
         return EXIT_FAILURE;
     }
 
-    // skip the @ symbol
+    // skip the '@' symbol
     ptr++;
 
-    // extract ip_address properly
+    // extract IP address
     index = 0;
-    while (*ptr)
+    while (*ptr != '\0')
     {
         ip_addr[index++] = *ptr++;
     }
-    ip_addr[index] = 0;
+    ip_addr[index] = '\0';
 
     if (!strcmp(ip_addr, "localhost"))
     {
@@ -80,18 +82,16 @@ int main(int argc, char **argv)
 
     char *endptr;
     int port = strtol(argv[2], &endptr, 10);
-
     if (*endptr)
     {
-        fprintf(stderr, "Invalid port number: %s\n", argv[2]);
-        return 1;
+        fprintf(stderr, "[ERROR] -> Invalid port number: %s\n", argv[2]);
+        return EXIT_FAILURE;
     }
 
     struct sockaddr_in server;
-    memset((void *)&server, 0, sizeof(struct sockaddr_in));
-
-    server.sin_family = AF_INET;   // set the family
-    server.sin_port = htons(port); // use htons for network byte order
+    memset(&server, 0, sizeof(struct sockaddr_in));
+    server.sin_family = AF_INET;
+    server.sin_port = htons(port);
 
     if (inet_pton(AF_INET, ip_addr, &server.sin_addr) != 1)
     {
@@ -106,21 +106,21 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    // cast to struct sockaddr* and pass correct size
-    if (connect(server_fd, (struct sockaddr *)&server, sizeof(server)) < 0)
+    if (connect(server_fd, (struct sockaddr *)&server, sizeof(struct sockaddr_in)) < 0)
     {
-        fprintf(stderr, "[ERROR] -> Couldn't connect to the server IPv4: %s Port: %d -> %s\n", ip_addr, port, strerror(errno));
+        fprintf(stderr, "[ERROR] -> Couldn't connect to the server IPv4: %s Port: %d -> %s\n",
+                ip_addr, port, strerror(errno));
         close(server_fd);
         return EXIT_FAILURE;
     }
 
-    // send a proper protocol message
-    send_to_server(server_fd, "HELLO\n");
+    // send hello message followed by username
+    send_to_server(server_fd, "HELLO");
     send_to_server(server_fd, user);
 
-    printf("[INFO] -> Connected to server at %s:%d as %s\n", ip_addr, port, user);
+    printf("Connected to server. Sent username: %s\n", user);
 
-    // add a clean shutdown
+    // clean up
     close(server_fd);
     return EXIT_SUCCESS;
 }
