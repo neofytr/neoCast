@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <pthread.h>
 
 #define MAX_STRLEN 4096
 #define BACKLOG 5
@@ -65,6 +66,34 @@ static char *receive_from_client(int client_fd)
     fprintf(stderr, "[ERROR] -> Message too long or missing terminator\n");
     free(buffer);
     return NULL;
+}
+
+void *client_handler(void *arg)
+{
+    long long client_fd = (long long)arg;
+
+    // receive hello message
+    char *hello_msg = receive_from_client(client_fd);
+    if (!hello_msg)
+    {
+        close(client_fd);
+    }
+
+    // receive username
+    char *username = receive_from_client(client_fd);
+    if (!username)
+    {
+        free(hello_msg);
+        close(client_fd);
+    }
+
+    // display the received information
+    printf("Received from client - Message: %s, Username: %s\n", hello_msg, username);
+
+    // cleanup
+    free(hello_msg);
+    free(username);
+    close(client_fd);
 }
 
 int main(int argc, char **argv)
@@ -128,46 +157,30 @@ int main(int argc, char **argv)
 
     while (1)
     {
+        socklen_t client_len = sizeof(struct sockaddr_in);
         struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
 
         // accept client connection
-        int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
+        long long client_fd = (long long)accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0)
         {
             fprintf(stderr, "[ERROR] -> Failed to accept connection: %s\n", strerror(errno));
             continue;
         }
 
+        // create a new thread to handle the new client
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+
+        pthread_t client;
+        pthread_create(&client, &attr, client_handler, (void *)client_fd);
+
+        pthread_attr_destroy(&attr);
+
         // get client's IP address
         char client_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &(client_addr.sin_addr), client_ip, INET_ADDRSTRLEN);
-        printf("New connection from %s:%d\n", client_ip, ntohs(client_addr.sin_port));
-
-        // receive hello message
-        char *hello_msg = receive_from_client(client_fd);
-        if (!hello_msg)
-        {
-            close(client_fd);
-            continue;
-        }
-
-        // receive username
-        char *username = receive_from_client(client_fd);
-        if (!username)
-        {
-            free(hello_msg);
-            close(client_fd);
-            continue;
-        }
-
-        // display the received information
-        printf("Received from client - Message: %s, Username: %s\n", hello_msg, username);
-
-        // cleanup
-        free(hello_msg);
-        free(username);
-        close(client_fd);
     }
 
     // close the server socket (this will never be reached in the current implementation)
