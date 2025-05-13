@@ -12,6 +12,7 @@
 #include <sys/select.h>
 
 #define INITIAL_BUFFER_SIZE 4096
+#define MAX_CMD_LENGTH 1024
 #define LOOPBACK "127.0.0.1"
 
 #define LOG_ERROR(msg, ...) fprintf(stderr, "[ERROR] " msg "\n", ##__VA_ARGS__)
@@ -57,6 +58,8 @@ static ssize_t safe_read(int fd, char *buffer, size_t buffer_size, int timeout_s
 
     if (ready < 0)
     {
+        if (errno == EINTR)
+            return 0; // Interrupted, treat as timeout
         LOG_ERROR("Select error: %s", strerror(errno));
         return -1;
     }
@@ -86,11 +89,8 @@ static ssize_t safe_read(int fd, char *buffer, size_t buffer_size, int timeout_s
  */
 static ssize_t safe_write(int fd, const char *buffer, size_t buffer_size)
 {
-    if (!buffer)
-    {
-        errno = EINVAL;
-        return -1;
-    }
+    if (!buffer || buffer_size == 0)
+        return 0;
 
     ssize_t total_written = 0;
 
@@ -105,6 +105,9 @@ static ssize_t safe_write(int fd, const char *buffer, size_t buffer_size)
             LOG_ERROR("Write error: %s", strerror(errno));
             return -1;
         }
+
+        if (!bytes_written)
+            break; // Can't write any more
 
         total_written += bytes_written;
     }
@@ -164,14 +167,14 @@ static char *dynamic_read(int fd, int timeout_seconds)
 
         bytes_read_total += bytes_read;
 
-        // stop reading on a newline
+        // Stop reading on a newline
         if (buffer[bytes_read_total - 1] == '\n')
         {
             break;
         }
     }
 
-    // trim trailing whitespace
+    // Trim trailing whitespace
     while (bytes_read_total > 0 &&
            (buffer[bytes_read_total - 1] == '\r' ||
             buffer[bytes_read_total - 1] == '\n' ||
@@ -196,7 +199,7 @@ static bool send_message(int fd, const char *msg)
     if (!msg)
         return false;
 
-    // add CRLF to the message
+    // Add CRLF to the message
     size_t msg_len = strlen(msg);
     char *buffer = malloc(msg_len + 3); // Room for message + \r\n\0
 
@@ -232,7 +235,7 @@ static char *read_password(const char *prompt)
         return NULL;
     }
 
-    // get the terminal attributes
+    // Get the terminal attributes
     if (tcgetattr(STDIN_FILENO, &old_term) != 0)
     {
         LOG_ERROR("Failed to get terminal attributes: %s", strerror(errno));
@@ -242,7 +245,7 @@ static char *read_password(const char *prompt)
 
     new_term = old_term;
 
-    // disable echo
+    // Disable echo
     new_term.c_lflag &= ~(ECHO | ICANON);
     if (tcsetattr(STDIN_FILENO, TCSANOW, &new_term) != 0)
     {
@@ -254,7 +257,7 @@ static char *read_password(const char *prompt)
     printf("%s", prompt);
     fflush(stdout);
 
-    // read password
+    // Read password
     if (fgets(password, INITIAL_BUFFER_SIZE, stdin) == NULL)
     {
         LOG_ERROR("Failed to read password");
@@ -263,14 +266,14 @@ static char *read_password(const char *prompt)
         return NULL;
     }
 
-    // restore terminal
+    // Restore terminal
     if (tcsetattr(STDIN_FILENO, TCSANOW, &old_term) != 0)
     {
         LOG_ERROR("Failed to restore terminal attributes: %s", strerror(errno));
-        // continue anyway as the password was already read
+        // Continue anyway as the password was already read
     }
 
-    // remove newline
+    // Remove newline
     size_t len = strlen(password);
     if (len > 0 && password[len - 1] == '\n')
     {
@@ -289,13 +292,13 @@ static char *read_password(const char *prompt)
  */
 static bool get_shell_prompt(int server_fd)
 {
-    // send a dummy command to get the initial prompt
+    // Send a dummy command to get the initial prompt
     if (!send_message(server_fd, "cd ."))
     {
         return false;
     }
 
-    // read and display the response (which includes the prompt)
+    // Read and display the response (which includes the prompt)
     char *response = dynamic_read(server_fd, 5);
     if (!response)
     {
@@ -303,6 +306,7 @@ static bool get_shell_prompt(int server_fd)
     }
 
     printf("%s", response);
+    fflush(stdout);
     free(response);
 
     return true;
@@ -325,14 +329,14 @@ static void prepare_terminal_raw(struct termios *old_term)
 
     new_term = *old_term;
 
-    // configure for raw mode
-    new_term.c_lflag &= ~(ICANON | ECHO | ECHOE | ECHOK | ECHONL | ISIG | IEXTEN);
+    // Configure for raw mode, but leave ISIG on to allow Ctrl+C to work
+    new_term.c_lflag &= ~(ICANON | ECHO | ECHOE | ECHOK | ECHONL | IEXTEN);
     new_term.c_iflag &= ~(IXON | ICRNL | INLCR | IGNCR);
     new_term.c_oflag &= ~OPOST;
 
-    // set character timeout values
-    new_term.c_cc[VMIN] = 1;  // read at least 1 character
-    new_term.c_cc[VTIME] = 0; // no timeout
+    // Set character timeout values
+    new_term.c_cc[VMIN] = 1;  // Read at least 1 character
+    new_term.c_cc[VTIME] = 0; // No timeout
 
     if (tcsetattr(STDIN_FILENO, TCSANOW, &new_term) != 0)
     {
@@ -364,11 +368,15 @@ static int interactive_shell(int server_fd)
     fd_set read_fds;
     char buffer[INITIAL_BUFFER_SIZE];
     struct termios old_term;
+    char cmd_buffer[MAX_CMD_LENGTH] = {0};
+    size_t cmd_len = 0;
+    bool waiting_for_prompt = false;
 
-    // get initial shell prompt
+    // Get initial shell prompt
     if (!get_shell_prompt(server_fd))
     {
         LOG_ERROR("Failed to get initial shell prompt");
+        return -1;
     }
 
     // set terminal to raw mode
@@ -395,10 +403,11 @@ static int interactive_shell(int server_fd)
             break;
         }
 
-        // input from user to send to server
+        // input from user
         if (FD_ISSET(STDIN_FILENO, &read_fds))
         {
-            ssize_t bytes_read = read(STDIN_FILENO, buffer, sizeof(buffer) - 1);
+            char input_char;
+            ssize_t bytes_read = read(STDIN_FILENO, &input_char, 1);
             if (bytes_read <= 0)
             {
                 if (bytes_read < 0)
@@ -408,22 +417,68 @@ static int interactive_shell(int server_fd)
                 break;
             }
 
-            buffer[bytes_read] = '\0';
-
-            // handle special key combinations (like Ctrl+D)
-            if (bytes_read == 1 && buffer[0] == 4)
-            { // Ctrl+D
+            // Handle special key combinations
+            if (input_char == 4 && cmd_len == 0)
+            { // Ctrl+D on empty line
                 break;
             }
-
-            // forward the input to server
-            if (safe_write(server_fd, buffer, bytes_read) < 0)
+            else if (input_char == '\r' || input_char == '\n')
             {
-                break;
+                // End of command - send to server
+                if (cmd_len > 0)
+                {
+                    cmd_buffer[cmd_len] = '\0';
+
+                    // Echo the newline locally
+                    write(STDOUT_FILENO, "\r\n", 2);
+
+                    // Send the complete command to server
+                    if (safe_write(server_fd, cmd_buffer, cmd_len) < 0 ||
+                        safe_write(server_fd, "\r\n", 2) < 0)
+                    {
+                        LOG_ERROR("Failed to send command to server");
+                        break;
+                    }
+
+                    // Reset command buffer
+                    cmd_len = 0;
+                    memset(cmd_buffer, 0, MAX_CMD_LENGTH);
+                    waiting_for_prompt = true;
+                }
+                else
+                {
+                    // Empty command - just send the newline
+                    write(STDOUT_FILENO, "\r\n", 2);
+                    safe_write(server_fd, "\r\n", 2);
+                    waiting_for_prompt = true;
+                }
+            }
+            else if (input_char == 127 || input_char == '\b')
+            {
+                // Backspace
+                if (cmd_len > 0)
+                {
+                    cmd_len--;
+                    cmd_buffer[cmd_len] = '\0';
+
+                    // Echo the backspace (move cursor back, space, move cursor back)
+                    write(STDOUT_FILENO, "\b \b", 3);
+                }
+            }
+            else if (input_char >= 32 && input_char < 127)
+            {
+                // Regular printable character
+                if (cmd_len < MAX_CMD_LENGTH - 1)
+                {
+                    cmd_buffer[cmd_len++] = input_char;
+
+                    // Echo the character locally
+                    write(STDOUT_FILENO, &input_char, 1);
+                }
             }
         }
 
-        // response from server
+        // Response from server
         if (FD_ISSET(server_fd, &read_fds))
         {
             ssize_t bytes_read = safe_read(server_fd, buffer, sizeof(buffer), 0);
@@ -440,22 +495,34 @@ static int interactive_shell(int server_fd)
                 break;
             }
 
-            // check for protocol messages
+            // Check for protocol messages
             if (!strncmp(buffer, "ERROR", 5))
             {
                 LOG_ERROR("Server Error: %s", buffer);
+                write(STDOUT_FILENO, buffer, bytes_read);
+                write(STDOUT_FILENO, "\r\n", 2);
                 break;
             }
 
+            // Write the server's response to stdout
             if (safe_write(STDOUT_FILENO, buffer, bytes_read) < 0)
             {
                 LOG_ERROR("Error writing to stdout: %s", strerror(errno));
                 break;
             }
+
+            // If we were waiting for a prompt, we now have it
+            if (waiting_for_prompt)
+            {
+                waiting_for_prompt = false;
+            }
+
+            // Make sure output is displayed immediately
+            fflush(stdout);
         }
     }
 
-    // restore terminal settings
+    // Restore terminal settings
     restore_terminal(&old_term);
 
     return 0;
@@ -532,7 +599,7 @@ int main(int argc, char **argv)
 
     if (inet_pton(AF_INET, ip_addr, &server.sin_addr) != 1)
     {
-        LOG_ERROR("Invalid IPv4 %s: %s", ip_addr, strerror(errno));
+        LOG_ERROR("Invalid IPv4 address %s: %s", ip_addr, strerror(errno));
         free(username);
         free(ip_addr);
         return EXIT_FAILURE;
@@ -575,9 +642,16 @@ int main(int argc, char **argv)
     for (int attempts = 0; attempts < 3; attempts++)
     {
         char *server_response = dynamic_read(server_fd, 10);
-        if (!server_response || strcmp(server_response, "PASSWORD_REQUEST") != 0)
+        if (!server_response)
         {
-            LOG_ERROR("Invalid server response during authentication");
+            LOG_ERROR("Server did not respond to authentication request");
+            close(server_fd);
+            return EXIT_FAILURE;
+        }
+
+        if (strcmp(server_response, "PASSWORD_REQUEST") != 0)
+        {
+            LOG_ERROR("Invalid server response during authentication: %s", server_response);
             free(server_response);
             close(server_fd);
             return EXIT_FAILURE;
@@ -599,6 +673,7 @@ int main(int argc, char **argv)
             return EXIT_FAILURE;
         }
 
+        // Clear password from memory for security
         memset(password, 0, strlen(password));
         free(password);
 
@@ -632,5 +707,5 @@ int main(int argc, char **argv)
     int result = interactive_shell(server_fd);
 
     close(server_fd);
-    return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    return !result ? EXIT_SUCCESS : EXIT_FAILURE;
 }
