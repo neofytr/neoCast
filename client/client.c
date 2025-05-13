@@ -24,7 +24,6 @@ static char *dynamic_read(int fd, int timeout_seconds);
 static bool send_message(int fd, const char *msg);
 static char *read_password(const char *prompt);
 static int interactive_shell(int server_fd);
-static bool get_shell_prompt(int server_fd);
 static void restore_terminal(struct termios *old_term);
 static void prepare_terminal_raw(struct termios *old_term);
 
@@ -285,34 +284,6 @@ static char *read_password(const char *prompt)
 }
 
 /**
- * Gets the initial shell prompt by sending a "cd ." command
- *
- * @param server_fd Socket connected to the server
- * @return true on success, false on failure
- */
-static bool get_shell_prompt(int server_fd)
-{
-    // Send a dummy command to get the initial prompt
-    if (!send_message(server_fd, "cd ."))
-    {
-        return false;
-    }
-
-    // Read and display the response (which includes the prompt)
-    char *response = dynamic_read(server_fd, 5);
-    if (!response)
-    {
-        return false;
-    }
-
-    printf("%s", response);
-    fflush(stdout);
-    free(response);
-
-    return true;
-}
-
-/**
  * Prepares the terminal for raw mode input
  *
  * @param old_term Structure to store original terminal settings
@@ -365,167 +336,133 @@ static void restore_terminal(struct termios *old_term)
  */
 static int interactive_shell(int server_fd)
 {
-    fd_set read_fds;
-    char buffer[INITIAL_BUFFER_SIZE];
-    struct termios old_term;
-    char cmd_buffer[MAX_CMD_LENGTH] = {0};
-    size_t cmd_len = 0;
-    bool waiting_for_prompt = false;
+    int ret = 0;
 
-    // Get initial shell prompt
-    if (!get_shell_prompt(server_fd))
+    // Store original terminal settings
+    struct termios old_term;
+    if (tcgetattr(STDIN_FILENO, &old_term) != 0)
     {
-        LOG_ERROR("Failed to get initial shell prompt");
+        LOG_ERROR("Failed to get terminal attributes: %s", strerror(errno));
         return -1;
     }
 
-    // set terminal to raw mode
-    prepare_terminal_raw(&old_term);
+    // Configure terminal for interactive use
+    // Allow canonical (line) mode but disable terminal echo
+    struct termios shell_term = old_term;
+    shell_term.c_lflag &= ~(ECHO | ECHONL); // Disable local echo
+    shell_term.c_lflag |= ICANON;           // Enable canonical mode
 
-    while (true)
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &shell_term) != 0)
     {
-        FD_ZERO(&read_fds);
-        FD_SET(STDIN_FILENO, &read_fds);
-        FD_SET(server_fd, &read_fds);
+        LOG_ERROR("Failed to set terminal attributes: %s", strerror(errno));
+        return -1;
+    }
 
-        int max_fd = (STDIN_FILENO > server_fd ? STDIN_FILENO : server_fd) + 1;
+    // Get initial prompt
+    char *initial_prompt = dynamic_read(server_fd, 5);
+    if (initial_prompt)
+    {
+        printf("%s", initial_prompt);
+        free(initial_prompt);
+        fflush(stdout);
+    }
 
-        // wait for activity on either stdin or server socket
-        int activity = select(max_fd, &read_fds, NULL, NULL, NULL);
-        if (activity < 0)
+    // Process command line input and server responses
+    char input_buffer[MAX_CMD_LENGTH];
+
+    // Set server socket to non-blocking
+    int flags = fcntl(server_fd, F_GETFL, 0);
+    fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
+
+    // Main processing loop
+    while (1)
+    {
+        // First check for server data (non-blocking)
+        char server_buffer[INITIAL_BUFFER_SIZE];
+        ssize_t bytes_read = read(server_fd, server_buffer, sizeof(server_buffer) - 1);
+
+        if (bytes_read > 0)
         {
-            if (errno == EINTR)
-            {
-                // interrupted system call, just retry
-                continue;
-            }
-            LOG_ERROR("Select error: %s", strerror(errno));
+            server_buffer[bytes_read] = '\0';
+            write(STDOUT_FILENO, server_buffer, bytes_read);
+            fflush(stdout);
+        }
+        else if (bytes_read == 0)
+        {
+            // Server closed connection
+            LOG_INFO("Server closed connection");
+            ret = 0;
+            break;
+        }
+        else if (errno != EAGAIN && errno != EWOULDBLOCK)
+        {
+            // Real error (not just non-blocking)
+            LOG_ERROR("Error reading from server: %s", strerror(errno));
+            ret = -1;
             break;
         }
 
-        // input from user
-        if (FD_ISSET(STDIN_FILENO, &read_fds))
+        // Now check for user input (with a timeout)
+        fd_set read_fds;
+        FD_ZERO(&read_fds);
+        FD_SET(STDIN_FILENO, &read_fds);
+
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000; // 100ms timeout
+
+        int activity = select(STDIN_FILENO + 1, &read_fds, NULL, NULL, &tv);
+
+        if (activity < 0)
         {
-            char input_char;
-            ssize_t bytes_read = read(STDIN_FILENO, &input_char, 1);
-            if (bytes_read <= 0)
-            {
-                if (bytes_read < 0)
-                {
-                    LOG_ERROR("Error reading from stdin: %s", strerror(errno));
-                }
-                break;
-            }
-
-            // Handle special key combinations
-            if (input_char == 4 && cmd_len == 0)
-            { // Ctrl+D on empty line
-                break;
-            }
-            else if (input_char == '\r' || input_char == '\n')
-            {
-                // End of command - send to server
-                if (cmd_len > 0)
-                {
-                    cmd_buffer[cmd_len] = '\0';
-
-                    // Echo the newline locally
-                    write(STDOUT_FILENO, "\r\n", 2);
-
-                    // Send the complete command to server
-                    if (safe_write(server_fd, cmd_buffer, cmd_len) < 0 ||
-                        safe_write(server_fd, "\r\n", 2) < 0)
-                    {
-                        LOG_ERROR("Failed to send command to server");
-                        break;
-                    }
-
-                    // Reset command buffer
-                    cmd_len = 0;
-                    memset(cmd_buffer, 0, MAX_CMD_LENGTH);
-                    waiting_for_prompt = true;
-                }
-                else
-                {
-                    // Empty command - just send the newline
-                    write(STDOUT_FILENO, "\r\n", 2);
-                    safe_write(server_fd, "\r\n", 2);
-                    waiting_for_prompt = true;
-                }
-            }
-            else if (input_char == 127 || input_char == '\b')
-            {
-                // Backspace
-                if (cmd_len > 0)
-                {
-                    cmd_len--;
-                    cmd_buffer[cmd_len] = '\0';
-
-                    // Echo the backspace (move cursor back, space, move cursor back)
-                    write(STDOUT_FILENO, "\b \b", 3);
-                }
-            }
-            else if (input_char >= 32 && input_char < 127)
-            {
-                // Regular printable character
-                if (cmd_len < MAX_CMD_LENGTH - 1)
-                {
-                    cmd_buffer[cmd_len++] = input_char;
-
-                    // Echo the character locally
-                    write(STDOUT_FILENO, &input_char, 1);
-                }
-            }
+            if (errno == EINTR)
+                continue;
+            LOG_ERROR("Select error: %s", strerror(errno));
+            ret = -1;
+            break;
         }
 
-        // Response from server
-        if (FD_ISSET(server_fd, &read_fds))
+        if (activity > 0 && FD_ISSET(STDIN_FILENO, &read_fds))
         {
-            ssize_t bytes_read = safe_read(server_fd, buffer, sizeof(buffer), 0);
-            if (bytes_read <= 0)
+            // Read a line from the user
+            if (fgets(input_buffer, sizeof(input_buffer), stdin) == NULL)
             {
-                if (bytes_read < 0)
+                if (feof(stdin))
                 {
-                    LOG_ERROR("Error reading from server: %s", strerror(errno));
+                    // End of input (Ctrl+D)
+                    break;
                 }
-                else
+                LOG_ERROR("Error reading from stdin: %s", strerror(errno));
+                ret = -1;
+                break;
+            }
+
+            // Echo the input to the terminal
+            size_t input_len = strlen(input_buffer);
+            if (input_len > 0)
+            {
+                // Echo the input back to the user
+                printf("%s", input_buffer);
+                fflush(stdout);
+
+                // Send to server (converting newlines properly)
+                if (input_buffer[input_len - 1] == '\n')
+                    input_buffer[input_len - 1] = '\0'; // Remove trailing newline
+
+                // Send the command
+                if (!send_message(server_fd, input_buffer))
                 {
-                    LOG_INFO("Server closed connection");
+                    LOG_ERROR("Failed to send command to server");
+                    ret = -1;
+                    break;
                 }
-                break;
             }
-
-            // Check for protocol messages
-            if (!strncmp(buffer, "ERROR", 5))
-            {
-                LOG_ERROR("Server Error: %s", buffer);
-                write(STDOUT_FILENO, buffer, bytes_read);
-                write(STDOUT_FILENO, "\r\n", 2);
-                break;
-            }
-
-            // Write the server's response to stdout
-            if (safe_write(STDOUT_FILENO, buffer, bytes_read) < 0)
-            {
-                LOG_ERROR("Error writing to stdout: %s", strerror(errno));
-                break;
-            }
-
-            // If we were waiting for a prompt, we now have it
-            if (waiting_for_prompt)
-            {
-                waiting_for_prompt = false;
-            }
-
-            // Make sure output is displayed immediately
-            fflush(stdout);
         }
     }
 
-    // Restore terminal settings
-    restore_terminal(&old_term);
-
-    return 0;
+    // Cleanup and restore terminal settings
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &old_term);
+    return ret;
 }
 
 /**
