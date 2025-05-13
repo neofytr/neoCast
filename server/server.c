@@ -1,5 +1,3 @@
-// Improved Remote Shell Server
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,7 +11,6 @@
 #include <pty.h>
 #include <sys/select.h>
 #include <sys/wait.h>
-#include <stdbool.h>
 #include <shadow.h>
 #include <crypt.h>
 #include <pwd.h>
@@ -52,21 +49,22 @@ static ssize_t safe_read(int fd, char *buffer, size_t buffer_size)
 
     if (ready < 0)
     {
+        if (errno == EINTR)
+            return 0; // interrupted, treat as timeout
         LOG_ERROR("Select error: %s", strerror(errno));
         return -1;
     }
 
-    if (ready == 0)
+    if (!ready)
     {
-        LOG_ERROR("Read timeout");
-        return 0;
+        return 0; // timeout
     }
 
     ssize_t bytes_read = read(fd, buffer, buffer_size - 1);
 
     if (bytes_read > 0)
     {
-        buffer[bytes_read] = '\0'; // Null-terminate
+        buffer[bytes_read] = '\0'; // null-terminate
     }
 
     return bytes_read;
@@ -74,6 +72,9 @@ static ssize_t safe_read(int fd, char *buffer, size_t buffer_size)
 
 static ssize_t safe_write(int fd, const char *buffer, size_t buffer_size)
 {
+    if (!buffer || buffer_size == 0)
+        return 0;
+
     ssize_t total_written = 0;
 
     while (total_written < buffer_size)
@@ -83,10 +84,13 @@ static ssize_t safe_write(int fd, const char *buffer, size_t buffer_size)
         if (bytes_written < 0)
         {
             if (errno == EINTR)
-                continue; // Interrupted, retry
+                continue; // interrupted, retry
             LOG_ERROR("Write error: %s", strerror(errno));
             return -1;
         }
+
+        if (!bytes_written)
+            break; // can't write any more
 
         total_written += bytes_written;
     }
@@ -112,6 +116,7 @@ static char *receive_from_client(int client_fd)
         return NULL;
     }
 
+    // remove trailing whitespace
     while (bytes_read > 0 && (buffer[bytes_read - 1] == '\r' ||
                               buffer[bytes_read - 1] == '\n' ||
                               buffer[bytes_read - 1] == ' '))
@@ -136,6 +141,9 @@ static bool send_to_client(int client_fd, const char *msg)
 
 static bool authenticate_user(const char *username, const char *password)
 {
+    if (!username || !password)
+        return false;
+
     struct spwd *shadow_entry = getspnam(username);
     if (!shadow_entry)
     {
@@ -149,6 +157,9 @@ static bool authenticate_user(const char *username, const char *password)
 
 static bool drop_privileges(const char *username)
 {
+    if (!username)
+        return false;
+
     struct passwd *pw = getpwnam(username);
     if (!pw)
     {
@@ -159,14 +170,20 @@ static bool drop_privileges(const char *username)
     // change to user's home directory
     if (chdir(pw->pw_dir) != 0)
     {
-        LOG_ERROR("Failed to change directory");
+        LOG_ERROR("Failed to change directory to %s: %s", pw->pw_dir, strerror(errno));
         return false;
     }
 
     // set group and user IDs
-    if (setgid(pw->pw_gid) != 0 || setuid(pw->pw_uid) != 0)
+    if (setgid(pw->pw_gid) != 0)
     {
-        LOG_ERROR("Failed to set user/group IDs");
+        LOG_ERROR("Failed to set group ID: %s", strerror(errno));
+        return false;
+    }
+
+    if (setuid(pw->pw_uid) != 0)
+    {
+        LOG_ERROR("Failed to set user ID: %s", strerror(errno));
         return false;
     }
 
@@ -194,6 +211,7 @@ void *client_handler(void *arg)
     pid_t child_pid = -1;
     char *username = NULL;
 
+    // Receive username
     username = receive_from_client(client_fd);
     if (!username)
     {
@@ -205,6 +223,7 @@ void *client_handler(void *arg)
 
     LOG_INFO("Received username: %s", username);
 
+    // authentication loop
     bool authenticated = false;
     for (int attempts = 0; attempts < MAX_LOGIN_ATTEMPTS; attempts++)
     {
@@ -239,11 +258,18 @@ void *client_handler(void *arg)
         return NULL;
     }
 
-    child_pid = forkpty(&master_fd, NULL, NULL, NULL);
+    // create pseudo-terminal
+    struct winsize term_size = {
+        .ws_row = 24,
+        .ws_col = 80,
+        .ws_xpixel = 0,
+        .ws_ypixel = 0};
+
+    child_pid = forkpty(&master_fd, NULL, NULL, &term_size);
 
     if (child_pid < 0)
     {
-        LOG_ERROR("Failed to fork pseudo-terminal");
+        LOG_ERROR("Failed to fork pseudo-terminal: %s", strerror(errno));
         send_to_client(client_fd, "ERROR: PTY creation failed");
         cleanup_and_close(client_fd, master_fd, child_pid);
         free(username);
@@ -267,11 +293,20 @@ void *client_handler(void *arg)
         }
 
         execl(pw->pw_shell, pw->pw_shell, NULL);
+
+        // if we get here, exec failed
+        LOG_ERROR("Failed to execute shell: %s", strerror(errno));
         exit(EXIT_FAILURE);
     }
 
     // parent process: relay data
+    free(username); // don't need username anymore
+
     fd_set read_fds;
+    char buffer[MAX_STRLEN];
+    char cmd_buffer[MAX_STRLEN] = {0};
+    size_t cmd_len = 0;
+
     while (1)
     {
         FD_ZERO(&read_fds);
@@ -282,42 +317,58 @@ void *client_handler(void *arg)
 
         if (select(max_fd, &read_fds, NULL, NULL, NULL) < 0)
         {
-            LOG_ERROR("Select failed");
+            if (errno == EINTR)
+                continue; // interrupted, retry
+
+            LOG_ERROR("Select failed: %s", strerror(errno));
             break;
         }
 
         // client to PTY
         if (FD_ISSET(client_fd, &read_fds))
         {
-            char *cmd = receive_from_client(client_fd);
-            if (!cmd)
+            ssize_t bytes_read = safe_read(client_fd, buffer, sizeof(buffer));
+            if (bytes_read <= 0)
+            {
+                if (bytes_read < 0)
+                    LOG_ERROR("Error reading from client: %s", strerror(errno));
                 break;
+            }
 
-            write(master_fd, cmd, strlen(cmd));
-            write(master_fd, "\n", 1);
-            free(cmd);
+            // write directly to master PTY - the client will handle line buffering
+            if (safe_write(master_fd, buffer, bytes_read) < 0)
+            {
+                LOG_ERROR("Error writing to PTY: %s", strerror(errno));
+                break;
+            }
         }
 
         // PTY to client
         if (FD_ISSET(master_fd, &read_fds))
         {
-            char buffer[MAX_STRLEN];
             ssize_t bytes_read = read(master_fd, buffer, sizeof(buffer) - 1);
 
-            if (bytes_read > 0)
+            if (bytes_read <= 0)
             {
-                buffer[bytes_read] = '\0';
-                send_to_client(client_fd, buffer);
+                if (bytes_read < 0)
+                    LOG_ERROR("Error reading from PTY: %s", strerror(errno));
+                else
+                    LOG_INFO("PTY closed connection");
+                break;
             }
-            else
+
+            buffer[bytes_read] = '\0';
+
+            // send data directly to client
+            if (safe_write(client_fd, buffer, bytes_read) < 0)
             {
+                LOG_ERROR("Error writing to client: %s", strerror(errno));
                 break;
             }
         }
     }
 
     cleanup_and_close(client_fd, master_fd, child_pid);
-    free(username);
     return NULL;
 }
 
@@ -329,6 +380,7 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    // parse port
     char *endptr;
     int port = strtol(argv[1], &endptr, 10);
     if (*endptr || port <= 0 || port > 65535)
@@ -337,6 +389,7 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    // create socket
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0)
     {
@@ -377,6 +430,7 @@ int main(int argc, char **argv)
     {
         struct sockaddr_in client_addr;
         socklen_t client_len = sizeof(client_addr);
+        char client_ip[INET_ADDRSTRLEN];
 
         long long client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
         if (client_fd < 0)
@@ -385,6 +439,9 @@ int main(int argc, char **argv)
             continue;
         }
 
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
+        LOG_INFO("New connection from %s:%d", client_ip, ntohs(client_addr.sin_port));
+
         pthread_attr_t attr;
         pthread_attr_init(&attr);
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
@@ -392,7 +449,7 @@ int main(int argc, char **argv)
         pthread_t client_thread;
         if (pthread_create(&client_thread, &attr, client_handler, (void *)client_fd) != 0)
         {
-            LOG_ERROR("Thread creation failed");
+            LOG_ERROR("Thread creation failed: %s", strerror(errno));
             close(client_fd);
         }
 

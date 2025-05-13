@@ -17,7 +17,6 @@
 #define LOG_ERROR(msg, ...) fprintf(stderr, "[ERROR] " msg "\n", ##__VA_ARGS__)
 #define LOG_INFO(msg, ...) fprintf(stdout, "[INFO] " msg "\n", ##__VA_ARGS__)
 
-/* Function prototypes */
 static ssize_t safe_read(int fd, char *buffer, size_t buffer_size, int timeout_seconds);
 static ssize_t safe_write(int fd, const char *buffer, size_t buffer_size);
 static char *dynamic_read(int fd, int timeout_seconds);
